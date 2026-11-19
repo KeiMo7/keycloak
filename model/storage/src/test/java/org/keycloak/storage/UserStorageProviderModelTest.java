@@ -18,10 +18,13 @@
 package org.keycloak.storage;
 
 import org.keycloak.storage.UserStorageProviderModel.SyncMode;
+import org.keycloak.storage.UserStorageProviderModel.SyncStatus;
 
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Unit tests for {@link UserStorageProviderModel}.
@@ -57,5 +60,32 @@ public class UserStorageProviderModelTest {
         model.getConfig().putSingle(UserStorageProviderModel.LAST_SYNC, "1600000000");
 
         assertEquals(1600000000, model.getLastSync(null));
+    }
+
+    @Test
+    public void testSyncStateIsPersistedPerMode() {
+        UserStorageProviderModel model = new UserStorageProviderModel();
+
+        model.setSyncStatus(SyncMode.FULL, SyncStatus.RUNNING);
+        model.setSyncCursor(SyncMode.FULL, "cursor-value");
+        model.setSyncProcessed(SyncMode.FULL, 20000);
+        model.setSyncTotal(SyncMode.FULL, 100000);
+        model.setSyncRemaining(SyncMode.FULL, 80000);
+        model.setSyncPhase(SyncMode.FULL, "USERS");
+        model.setSyncRunId(SyncMode.FULL, "run-1");
+        model.setSyncRetryable(SyncMode.FULL, true);
+
+        assertEquals(SyncStatus.RUNNING, model.getSyncStatus(SyncMode.FULL));
+        assertEquals("cursor-value", model.getSyncCursor(SyncMode.FULL));
+        assertEquals(20000, model.getSyncProcessed(SyncMode.FULL));
+        assertEquals(100000, model.getSyncTotal(SyncMode.FULL));
+        assertEquals(80000, model.getSyncRemaining(SyncMode.FULL));
+        assertEquals("USERS", model.getSyncPhase(SyncMode.FULL));
+        assertEquals("run-1", model.getSyncRunId(SyncMode.FULL));
+        assertTrue(model.isSyncRetryable(SyncMode.FULL));
+
+        assertEquals(SyncStatus.IDLE, model.getSyncStatus(SyncMode.CHANGED));
+        assertEquals(-1, model.getSyncTotal(SyncMode.CHANGED));
+        assertFalse(model.isSyncRetryable(SyncMode.CHANGED));
     }
 }

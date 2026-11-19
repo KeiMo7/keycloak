@@ -35,9 +35,22 @@ public class UserStorageProviderModel extends CacheableStorageProviderModel {
     public static final String CHANGED_SYNC_PERIOD = "changedSyncPeriod";
     public static final String LAST_SYNC = "lastSync";
     public static final String REMOVE_INVALID_USERS_ENABLED = "removeInvalidUsersEnabled";
+    public static final String SYNC_STATUS = "syncStatus";
+    public static final String SYNC_CURSOR = "syncCursor";
+    public static final String SYNC_PROCESSED = "syncProcessed";
+    public static final String SYNC_TOTAL = "syncTotal";
+    public static final String SYNC_REMAINING = "syncRemaining";
+    public static final String SYNC_PHASE = "syncPhase";
+    public static final String SYNC_RUN_ID = "syncRunId";
+    public static final String SYNC_RETRYABLE = "syncRetryable";
+    public static final String SYNC_UPDATED_AT = "syncUpdatedAt";
 
     public enum SyncMode {
         FULL, CHANGED;
+    }
+
+    public enum SyncStatus {
+        IDLE, RUNNING, COMPLETE, FAILED
     }
 
     public UserStorageProviderModel() {
@@ -135,5 +148,121 @@ public class UserStorageProviderModel extends CacheableStorageProviderModel {
             }
         }
         return removeInvalidUsersEnabled;
+    }
+
+    public SyncStatus getSyncStatus(SyncMode mode) {
+        String value = getConfig().getFirst(syncKey(SYNC_STATUS, mode));
+        if (value == null) {
+            return SyncStatus.IDLE;
+        }
+        try {
+            return SyncStatus.valueOf(value);
+        } catch (IllegalArgumentException e) {
+            return SyncStatus.IDLE;
+        }
+    }
+
+    public void setSyncStatus(SyncMode mode, SyncStatus status) {
+        getConfig().putSingle(syncKey(SYNC_STATUS, mode), status.name());
+    }
+
+    public String getSyncCursor(SyncMode mode) {
+        return getConfig().getFirst(syncKey(SYNC_CURSOR, mode));
+    }
+
+    public void setSyncCursor(SyncMode mode, String cursor) {
+        setOrRemove(syncKey(SYNC_CURSOR, mode), cursor);
+    }
+
+    public int getSyncProcessed(SyncMode mode) {
+        return getInt(syncKey(SYNC_PROCESSED, mode), 0);
+    }
+
+    public void setSyncProcessed(SyncMode mode, int processed) {
+        getConfig().putSingle(syncKey(SYNC_PROCESSED, mode), Integer.toString(processed));
+    }
+
+    public int getSyncTotal(SyncMode mode) {
+        return getInt(syncKey(SYNC_TOTAL, mode), -1);
+    }
+
+    public void setSyncTotal(SyncMode mode, int total) {
+        getConfig().putSingle(syncKey(SYNC_TOTAL, mode), Integer.toString(total));
+    }
+
+    public int getSyncRemaining(SyncMode mode) {
+        return getInt(syncKey(SYNC_REMAINING, mode), -1);
+    }
+
+    public void setSyncRemaining(SyncMode mode, int remaining) {
+        getConfig().putSingle(syncKey(SYNC_REMAINING, mode), Integer.toString(remaining));
+    }
+
+    public String getSyncPhase(SyncMode mode) {
+        return getConfig().getFirst(syncKey(SYNC_PHASE, mode));
+    }
+
+    public void setSyncPhase(SyncMode mode, String phase) {
+        setOrRemove(syncKey(SYNC_PHASE, mode), phase);
+    }
+
+    public String getSyncRunId(SyncMode mode) {
+        return getConfig().getFirst(syncKey(SYNC_RUN_ID, mode));
+    }
+
+    public void setSyncRunId(SyncMode mode, String runId) {
+        setOrRemove(syncKey(SYNC_RUN_ID, mode), runId);
+    }
+
+    public boolean isSyncRetryable(SyncMode mode) {
+        return Boolean.parseBoolean(getConfig().getFirst(syncKey(SYNC_RETRYABLE, mode)));
+    }
+
+    public void setSyncRetryable(SyncMode mode, boolean retryable) {
+        getConfig().putSingle(syncKey(SYNC_RETRYABLE, mode), Boolean.toString(retryable));
+    }
+
+    public long getSyncUpdatedAt(SyncMode mode) {
+        return getLong(syncKey(SYNC_UPDATED_AT, mode), 0L);
+    }
+
+    public void setSyncUpdatedAt(SyncMode mode, long updatedAt) {
+        getConfig().putSingle(syncKey(SYNC_UPDATED_AT, mode), Long.toString(updatedAt));
+    }
+
+    private static String syncKey(String key, SyncMode mode) {
+        return key + "_" + mode.name();
+    }
+
+    private int getInt(String key, int defaultValue) {
+        String value = getConfig().getFirst(key);
+        if (value == null) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
+    private long getLong(String key, long defaultValue) {
+        String value = getConfig().getFirst(key);
+        if (value == null) {
+            return defaultValue;
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
+    private void setOrRemove(String key, String value) {
+        if (value == null) {
+            getConfig().remove(key);
+        } else {
+            getConfig().putSingle(key, value);
+        }
     }
 }

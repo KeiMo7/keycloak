@@ -153,6 +153,36 @@ When synchronizing, {project_name} creates or updates users created or updated a
 
 The best way to synchronize is to click *Synchronize all users* when you first create the LDAP provider, then set up periodic synchronization of changed users.
 
+==== Merge and conflict rules during synchronization
+
+The LDAP provider keeps synchronization metadata on imported users so that a full sync resolves changes deterministically instead of letting the last writer win silently.
+The default is the existing behavior (`LEGACY`), so existing deployments keep their current merge semantics until the rules below are configured.
+
+Directory deletion::
+Set *Directory Deletion Mode* to `DISABLE` to propagate a deletion from LDAP after a full sync completes successfully.
+Only users linked to that LDAP provider and seen by an earlier successful sync are affected.
+Users created locally and users not linked to the provider are never touched.
+The user is disabled instead of physically deleted, which preserves locally-created resources and references.
+Returning the user to LDAP re-enables the local account on the next sync.
+
+Attribute conflicts::
+Use the provider-level *Attribute Conflict Priorities* field, for example `email=DIRECTORY,phone=LOCAL`.
+An individual user-attribute mapper can override the provider value with its *Conflict Resolution Priority* option.
+`DIRECTORY` applies the LDAP value when both sides changed; `LOCAL` keeps the local value.
+Only the configured field is affected, so mixed policies such as directory-owned email and locally-owned phone numbers are supported.
+Each resolved conflict is written to the user's `kc.sync.audit.*` attributes and emitted as an `UPDATE_PROFILE` event with the detected time, local modification time and actor, directory modification time, selected policy, winner, and both values.
+
+Group ownership::
+When *Track Directory-Managed Groups* is enabled, synchronized groups are marked as directory-managed.
+Group synchronization only removes or overwrites directory-managed groups, so groups and group memberships created locally are preserved.
+
+Resumable synchronization::
+Paginated full syncs persist the last completed LDAP pagination cursor and the processed count after each page.
+If LDAP becomes unavailable, the local state is left unchanged and the next run resumes from that cursor instead of starting over.
+Network and directory availability failures are marked retryable.
+Data conflicts such as a duplicate username or email are skipped, recorded, and marked non-retryable so that they are not replayed indefinitely.
+Progress is available in the sync response and from `GET /admin/realms/{realm}/user-storage/{id}/sync/status`.
+
 [[_ldap_mappers]]
 ==== LDAP mappers
 

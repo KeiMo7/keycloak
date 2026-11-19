@@ -75,6 +75,7 @@ import org.keycloak.storage.user.UserLookupProvider;
 import org.keycloak.storage.user.UserQueryMethodsProvider;
 import org.keycloak.storage.user.UserQueryProvider;
 import org.keycloak.storage.user.UserRegistrationProvider;
+import org.keycloak.storage.user.UserSyncMetadata;
 import org.keycloak.tracing.TracingProvider;
 import org.keycloak.userprofile.AttributeMetadata;
 import org.keycloak.userprofile.UserProfileDecorator;
@@ -189,6 +190,12 @@ public class UserStorageManager extends AbstractStorageManager<UserStorageProvid
         }
 
         deleteInvalidUserCache(realm, user);
+
+        // Users disabled by a directory synchronization are retained deliberately so that locally-created
+        // resources and references do not disappear. A later directory sync can re-enable them if the user returns.
+        if (user.getFirstAttribute(UserSyncMetadata.DELETED_AT_ATTRIBUTE) != null) {
+            return new ReadOnlyUserModelDelegate(user, false);
+        }
 
         if (model.isRemoveInvalidUsersEnabled()) {
             deleteInvalidUser(realm, user);

@@ -67,6 +67,13 @@ public class UserAttributeLDAPStorageMapperFactory extends AbstractLDAPStorageMa
                 .helpText("Read-only attribute is imported from LDAP to UserModel, but it's not saved back to LDAP when user is updated in Keycloak.")
                 .type(ProviderConfigProperty.BOOLEAN_TYPE)
                 .defaultValue(readOnly)
+                .add()
+                .property().name(UserAttributeLDAPStorageMapper.SYNC_PRIORITY).label("Conflict Resolution Priority")
+                .helpText("Controls which value wins when both the directory and the local user changed this field. "
+                        + "LEGACY keeps the existing synchronization behavior.")
+                .type(ProviderConfigProperty.LIST_TYPE)
+                .options(Arrays.asList(LDAPConfig.SYNC_PRIORITY_LEGACY, LDAPConfig.SYNC_PRIORITY_DIRECTORY, LDAPConfig.SYNC_PRIORITY_LOCAL))
+                .defaultValue(LDAPConfig.SYNC_PRIORITY_LEGACY)
                 .add();
         if (parent.isImportEnabled()) {
             config.

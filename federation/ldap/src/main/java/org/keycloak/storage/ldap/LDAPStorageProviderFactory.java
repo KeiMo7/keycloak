@@ -18,6 +18,9 @@
 package org.keycloak.storage.ldap;
 
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -25,8 +28,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import javax.naming.CommunicationException;
 import javax.naming.NamingException;
 import javax.naming.spi.NamingManager;
 
@@ -54,10 +60,13 @@ import org.keycloak.provider.ProviderConfigProperty;
 import org.keycloak.provider.ProviderConfigurationBuilder;
 import org.keycloak.representations.idm.CredentialRepresentation;
 import org.keycloak.services.resources.admin.ComponentResource;
+import org.keycloak.storage.StorageUnavailableException;
 import org.keycloak.storage.UserStoragePrivateUtil;
 import org.keycloak.storage.UserStorageProvider;
 import org.keycloak.storage.UserStorageProviderFactory;
 import org.keycloak.storage.UserStorageProviderModel;
+import org.keycloak.storage.UserStorageProviderModel.SyncMode;
+import org.keycloak.storage.UserStorageProviderModel.SyncStatus;
 import org.keycloak.storage.UserStorageUtil;
 import org.keycloak.storage.ldap.idm.model.LDAPObject;
 import org.keycloak.storage.ldap.idm.query.Condition;
@@ -79,7 +88,9 @@ import org.keycloak.storage.ldap.mappers.UserAttributeLDAPStorageMapperFactory;
 import org.keycloak.storage.ldap.mappers.msad.MSADUserAccountControlStorageMapper;
 import org.keycloak.storage.ldap.mappers.msad.MSADUserAccountControlStorageMapperFactory;
 import org.keycloak.storage.user.ImportSynchronization;
+import org.keycloak.storage.user.SyncConflict;
 import org.keycloak.storage.user.SynchronizationResult;
+import org.keycloak.storage.user.UserSyncMetadata;
 import org.keycloak.utils.CredentialHelper;
 
 import io.micrometer.core.instrument.Meter;
@@ -203,6 +214,27 @@ public class LDAPStorageProviderFactory implements UserStorageProviderFactory<LD
                 .type(ProviderConfigProperty.STRING_TYPE)
                 .add()
                 .property().name(LDAPConstants.PAGINATION)
+                .type(ProviderConfigProperty.BOOLEAN_TYPE)
+                .defaultValue("true")
+                .add()
+                .property().name(LDAPConfig.SYNC_ATTRIBUTE_PRIORITIES)
+                .label("Attribute Conflict Priorities")
+                .helpText("Per-field conflict policy for user synchronization, for example 'email=DIRECTORY,phone=LOCAL'. "
+                        + "LOCAL keeps a local value when both sides changed; DIRECTORY applies the LDAP value.")
+                .type(ProviderConfigProperty.STRING_TYPE)
+                .defaultValue("")
+                .add()
+                .property().name(LDAPConfig.SYNC_DELETION_MODE)
+                .label("Directory Deletion Mode")
+                .helpText("LEGACY keeps the existing behavior. DISABLE disables users that disappeared from a completed "
+                        + "full directory sync without deleting local data. Local users not linked to this provider are never touched.")
+                .type(ProviderConfigProperty.LIST_TYPE)
+                .options(List.of(LDAPConfig.SYNC_DELETION_LEGACY, LDAPConfig.SYNC_DELETION_DISABLE))
+                .defaultValue(LDAPConfig.SYNC_DELETION_LEGACY)
+                .add()
+                .property().name(LDAPConfig.SYNC_GROUP_OWNERSHIP)
+                .label("Track Directory-Managed Groups")
+                .helpText("Marks groups imported from LDAP and keeps manually-created groups and their memberships intact during group synchronization.")
                 .type(ProviderConfigProperty.BOOLEAN_TYPE)
                 .defaultValue("true")
                 .add()
@@ -631,88 +663,310 @@ public class LDAPStorageProviderFactory implements UserStorageProviderFactory<LD
 
     @Override
     public SynchronizationResult sync(KeycloakSessionFactory sessionFactory, String realmId, UserStorageProviderModel model) {
-        syncMappers(sessionFactory, realmId, model);
-
         logger.infof("Sync all users from LDAP to local store: realm: %s, federation provider: %s", realmId, model.getName());
-
-        try (LDAPQuery userQuery = createQuery(sessionFactory, realmId, model)) {
-            SynchronizationResult syncResult = syncImpl(sessionFactory, userQuery, realmId, model);
-
-            // TODO: Remove all existing keycloak users, which have federation links, but are not in LDAP. Perhaps don't check users, which were just added or updated during this sync?
-
-            logger.infof("Sync all users finished: %s", syncResult.getStatus());
-            return syncResult;
-        }
+        SynchronizationResult syncResult = syncMode(SyncMode.FULL, null, sessionFactory, realmId, model);
+        logger.infof("Sync all users finished: %s", syncResult.getStatus());
+        return syncResult;
     }
 
     @Override
     public SynchronizationResult syncSince(Date lastSync, KeycloakSessionFactory sessionFactory, String realmId, UserStorageProviderModel model) {
-        syncMappers(sessionFactory, realmId, model);
-
         logger.infof("Sync changed users from LDAP to local store: realm: %s, federation provider: %s, last sync time: " + lastSync, realmId, model.getName());
+        SynchronizationResult result = syncMode(SyncMode.CHANGED, lastSync, sessionFactory, realmId, model);
+        logger.infof("Sync changed users finished: %s", result.getStatus());
+        return result;
+    }
 
-        // Sync newly created and updated users
-        LDAPQueryConditionsBuilder conditionsBuilder = new LDAPQueryConditionsBuilder();
-        Condition createCondition = conditionsBuilder.greaterThanOrEqualTo(LDAPConstants.CREATE_TIMESTAMP, lastSync);
-        Condition modifyCondition = conditionsBuilder.greaterThanOrEqualTo(LDAPConstants.MODIFY_TIMESTAMP, lastSync);
-        Condition orCondition = conditionsBuilder.orCondition(createCondition, modifyCondition);
+    private SynchronizationResult syncMode(SyncMode mode, Date lastSync, KeycloakSessionFactory sessionFactory,
+                                           String realmId, ComponentModel model) {
+        SyncState state = prepareSyncState(sessionFactory, realmId, model, mode);
+        SynchronizationResult syncResult = new SynchronizationResult();
+        syncResult.setResumed(state.resumed);
+        updateProgress(syncResult, state, "MAPPERS");
+        persistSyncState(sessionFactory, realmId, model.getId(), mode, current -> {
+            current.setSyncStatus(mode, SyncStatus.RUNNING);
+            current.setSyncPhase(mode, "MAPPERS");
+            current.setSyncRetryable(mode, false);
+            current.setSyncUpdatedAt(mode, org.keycloak.common.util.Time.currentTimeMillis());
+        });
+
+        syncResult.add(syncMappers(sessionFactory, realmId, model));
+        if (syncResult.isRetryable()) {
+            finalizeSyncState(sessionFactory, realmId, model.getId(), mode, state, syncResult);
+            return syncResult;
+        }
 
         try (LDAPQuery userQuery = createQuery(sessionFactory, realmId, model)) {
-            userQuery.addWhereCondition(orCondition);
-            SynchronizationResult result = syncImpl(sessionFactory, userQuery, realmId, model);
-
-            logger.infof("Sync changed users finished: %s", result.getStatus());
-            return result;
+            if (lastSync != null) {
+                LDAPQueryConditionsBuilder conditionsBuilder = new LDAPQueryConditionsBuilder();
+                Condition createCondition = conditionsBuilder.greaterThanOrEqualTo(LDAPConstants.CREATE_TIMESTAMP, lastSync);
+                Condition modifyCondition = conditionsBuilder.greaterThanOrEqualTo(LDAPConstants.MODIFY_TIMESTAMP, lastSync);
+                userQuery.addWhereCondition(conditionsBuilder.orCondition(createCondition, modifyCondition));
+            }
+            syncResult.add(syncImpl(sessionFactory, userQuery, realmId, model, mode, state));
+        } catch (Throwable t) {
+            addFailure(syncResult, t, "fetching LDAP users");
         }
+
+        if (mode == SyncMode.FULL && !syncResult.isRetryable() && syncResult.getNonRetryableFailures() == 0) {
+            try {
+                syncResult.add(disableDeletedUsers(sessionFactory, realmId, model, state.runId));
+            } catch (Throwable t) {
+                addFailure(syncResult, t, "propagating directory deletions");
+            }
+        }
+
+        finalizeSyncState(sessionFactory, realmId, model.getId(), mode, state, syncResult);
+        return syncResult;
     }
 
-    protected void syncMappers(KeycloakSessionFactory sessionFactory, final String realmId, final ComponentModel model) {
-        KeycloakModelUtils.runJobInTransaction(sessionFactory, new KeycloakSessionTask() {
-
-            @Override
-            public void run(KeycloakSession session) {
+    protected SynchronizationResult syncMappers(KeycloakSessionFactory sessionFactory, final String realmId, final ComponentModel model) {
+        SynchronizationResult result = new SynchronizationResult();
+        List<ComponentModel> mapperModels;
+        try {
+            mapperModels = KeycloakModelUtils.runJobInTransactionWithResult(sessionFactory, session -> {
                 RealmModel realm = session.realms().getRealm(realmId);
                 session.getContext().setRealm(realm);
-                session.getProvider(UserStorageProvider.class, model);
-                realm.getComponentsStream(model.getId(), LDAPStorageMapper.class.getName())
-                        .forEach(mapperModel -> {
-                            SynchronizationResult syncResult = session.getProvider(LDAPStorageMapper.class, mapperModel)
-                                    .syncDataFromFederationProviderToKeycloak(realm);
-                            if (syncResult.getAdded() > 0 || syncResult.getUpdated() > 0 || syncResult.getRemoved() > 0
-                                    || syncResult.getFailed() > 0) {
-                                logger.infof("Sync of federation mapper '%s' finished. Status: %s", mapperModel.getName(), syncResult.toString());
-                            }
-                        });
-            }
+                return realm.getComponentsStream(model.getId(), LDAPStorageMapper.class.getName()).toList();
+            });
+        } catch (Throwable t) {
+            addFailure(result, t, "loading LDAP mappers");
+            return result;
+        }
 
-        });
+        for (ComponentModel mapperModel : mapperModels) {
+            try {
+                SynchronizationResult mapperResult = KeycloakModelUtils.runJobInTransactionWithResult(sessionFactory, session -> {
+                    RealmModel realm = session.realms().getRealm(realmId);
+                    session.getContext().setRealm(realm);
+                    session.getProvider(UserStorageProvider.class, model);
+                    return session.getProvider(LDAPStorageMapper.class, mapperModel)
+                            .syncDataFromFederationProviderToKeycloak(realm);
+                });
+                result.add(mapperResult);
+                if (mapperResult.getAdded() > 0 || mapperResult.getUpdated() > 0 || mapperResult.getRemoved() > 0
+                        || mapperResult.getFailed() > 0 || mapperResult.getConflicts() > 0) {
+                    logger.infof("Sync of federation mapper '%s' finished. Status: %s", mapperModel.getName(), mapperResult.getStatus());
+                }
+            } catch (Throwable t) {
+                addFailure(result, t, "syncing federation mapper " + mapperModel.getName());
+            }
+        }
+        return result;
     }
 
-    protected SynchronizationResult syncImpl(KeycloakSessionFactory sessionFactory, LDAPQuery userQuery, final String realmId, final ComponentModel fedModel) {
-
+    protected SynchronizationResult syncImpl(KeycloakSessionFactory sessionFactory, LDAPQuery userQuery,
+                                             final String realmId, final ComponentModel fedModel,
+                                             SyncMode mode, SyncState state) {
         final SynchronizationResult syncResult = new SynchronizationResult();
-
         LDAPConfig ldapConfig = new LDAPConfig(fedModel.getConfig());
+        updateProgress(syncResult, state, "USERS");
+
+        if (mode == SyncMode.FULL && state.total < 0) {
+            state.total = countUsers(sessionFactory, realmId, fedModel);
+        }
+        if (state.total >= 0) {
+            syncResult.setTotal(state.total);
+            syncResult.setRemaining(remaining(state));
+        }
+
         boolean pagination = ldapConfig.isPagination();
+        String seenRunId = mode == SyncMode.FULL && LDAPConfig.SYNC_DELETION_DISABLE.equals(ldapConfig.getSyncDeletionMode())
+                ? state.runId : null;
         if (pagination) {
             int pageSize = ldapConfig.getBatchSizeForSync();
+            if (state.resumed && state.cursor != null) {
+                userQuery.setInitialPaginationCookie(decodeCursor(state.cursor));
+            }
 
             boolean nextPage = true;
             while (nextPage) {
-                userQuery.setLimit(pageSize);
-                final List<LDAPObject> users = userQuery.getResultList();
-                nextPage = userQuery.getPaginationContext().hasNextPage();
-                SynchronizationResult currentPageSync = importLdapUsers(sessionFactory, realmId, fedModel, users);
+                final List<LDAPObject> users;
+                try {
+                    userQuery.setLimit(pageSize);
+                    users = userQuery.getResultList();
+                    nextPage = userQuery.getPaginationContext().hasNextPage();
+                } catch (Throwable t) {
+                    addFailure(syncResult, t, "fetching an LDAP users page");
+                    updateProgress(syncResult, state, "RETRYING");
+                    persistSyncState(sessionFactory, realmId, fedModel.getId(), mode, current -> {
+                        current.setSyncStatus(mode, SyncStatus.FAILED);
+                        current.setSyncPhase(mode, "RETRYING");
+                        current.setSyncRetryable(mode, syncResult.isRetryable());
+                        current.setSyncProcessed(mode, state.processed);
+                        current.setSyncCursor(mode, state.cursor);
+                        current.setSyncTotal(mode, state.total);
+                        current.setSyncRemaining(mode, remaining(state));
+                        current.setSyncUpdatedAt(mode, org.keycloak.common.util.Time.currentTimeMillis());
+                    });
+                    return syncResult;
+                }
+
+                SynchronizationResult currentPageSync = importLdapUsers(sessionFactory, realmId, fedModel, users, seenRunId);
                 syncResult.add(currentPageSync);
+                if (currentPageSync.isRetryable()) {
+                    updateProgress(syncResult, state, "RETRYING");
+                    persistSyncState(sessionFactory, realmId, fedModel.getId(), mode, current -> {
+                        current.setSyncStatus(mode, SyncStatus.FAILED);
+                        current.setSyncPhase(mode, "RETRYING");
+                        current.setSyncRetryable(mode, true);
+                        current.setSyncProcessed(mode, state.processed);
+                        current.setSyncCursor(mode, state.cursor);
+                        current.setSyncTotal(mode, state.total);
+                        current.setSyncRemaining(mode, remaining(state));
+                        current.setSyncUpdatedAt(mode, org.keycloak.common.util.Time.currentTimeMillis());
+                    });
+                    return syncResult;
+                }
+
+                state.processed += users.size();
+                state.cursor = nextPage ? encodeCursor(userQuery.getPaginationContext().getCookie()) : null;
+                updateProgress(syncResult, state, "USERS");
+                persistSyncState(sessionFactory, realmId, fedModel.getId(), mode, current -> {
+                    current.setSyncStatus(mode, SyncStatus.RUNNING);
+                    current.setSyncPhase(mode, "USERS");
+                    current.setSyncRetryable(mode, false);
+                    current.setSyncProcessed(mode, state.processed);
+                    current.setSyncCursor(mode, state.cursor);
+                    current.setSyncTotal(mode, state.total);
+                    current.setSyncRemaining(mode, remaining(state));
+                    current.setSyncUpdatedAt(mode, org.keycloak.common.util.Time.currentTimeMillis());
+                });
             }
         } else {
             // LDAP pagination not available. Do everything in single transaction
-            final List<LDAPObject> users = userQuery.getResultList();
-            SynchronizationResult currentSync = importLdapUsers(sessionFactory, realmId, fedModel, users);
-            syncResult.add(currentSync);
+            try {
+                final List<LDAPObject> users = userQuery.getResultList();
+                SynchronizationResult currentSync = importLdapUsers(sessionFactory, realmId, fedModel, users, seenRunId);
+                syncResult.add(currentSync);
+                if (!currentSync.isRetryable()) {
+                    state.processed += users.size();
+                    state.total = users.size();
+                }
+            } catch (Throwable t) {
+                addFailure(syncResult, t, "fetching LDAP users");
+            }
         }
 
+        updateProgress(syncResult, state, "USERS");
         return syncResult;
+    }
+
+    protected SynchronizationResult syncImpl(KeycloakSessionFactory sessionFactory, LDAPQuery userQuery,
+                                             String realmId, ComponentModel fedModel) {
+        SyncState state = new SyncState();
+        state.runId = UUID.randomUUID().toString();
+        return syncImpl(sessionFactory, userQuery, realmId, fedModel, SyncMode.FULL, state);
+    }
+
+    private void finalizeSyncState(KeycloakSessionFactory sessionFactory, String realmId, String modelId,
+                                   SyncMode mode, SyncState state, SynchronizationResult result) {
+        boolean retryable = result.isRetryable();
+        if (!retryable) {
+            state.cursor = null;
+            if (state.total < 0) {
+                state.total = state.processed;
+            }
+            state.remaining = 0;
+        }
+        updateProgress(result, state, retryable ? "RETRYING" : "COMPLETE");
+        persistSyncState(sessionFactory, realmId, modelId, mode, current -> {
+            current.setSyncStatus(mode, retryable ? SyncStatus.FAILED : SyncStatus.COMPLETE);
+            current.setSyncPhase(mode, retryable ? "RETRYING" : "COMPLETE");
+            current.setSyncRetryable(mode, retryable);
+            current.setSyncProcessed(mode, state.processed);
+            current.setSyncCursor(mode, state.cursor);
+            current.setSyncTotal(mode, state.total);
+            current.setSyncRemaining(mode, retryable ? remaining(state) : 0);
+            current.setSyncUpdatedAt(mode, org.keycloak.common.util.Time.currentTimeMillis());
+        });
+    }
+
+    private SyncState prepareSyncState(KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model, SyncMode mode) {
+        SyncState state = new SyncState();
+        KeycloakModelUtils.runJobInTransaction(sessionFactory, session -> {
+            RealmModel realm = session.realms().getRealm(realmId);
+            if (realm == null) {
+                throw new ModelException("Realm " + realmId + " not found while preparing user synchronization");
+            }
+            session.getContext().setRealm(realm);
+            ComponentModel component = realm.getComponent(model.getId());
+            if (component == null) {
+                throw new ModelException("User storage provider " + model.getId() + " not found in realm " + realmId);
+            }
+            UserStorageProviderModel current = new UserStorageProviderModel(component);
+            SyncStatus status = current.getSyncStatus(mode);
+            String cursor = current.getSyncCursor(mode);
+            state.resumed = (status == SyncStatus.RUNNING || status == SyncStatus.FAILED) && cursor != null;
+            state.cursor = state.resumed ? cursor : null;
+            state.processed = state.resumed ? current.getSyncProcessed(mode) : 0;
+            state.total = state.resumed ? current.getSyncTotal(mode) : -1;
+            state.runId = state.resumed ? current.getSyncRunId(mode) : null;
+            if (state.runId == null) {
+                state.runId = UUID.randomUUID().toString();
+            }
+            state.remaining = remaining(state);
+
+            current.setSyncStatus(mode, SyncStatus.RUNNING);
+            current.setSyncPhase(mode, "MAPPERS");
+            current.setSyncProcessed(mode, state.processed);
+            current.setSyncCursor(mode, state.cursor);
+            current.setSyncTotal(mode, state.total);
+            current.setSyncRemaining(mode, state.remaining);
+            current.setSyncRunId(mode, state.runId);
+            current.setSyncRetryable(mode, false);
+            current.setSyncUpdatedAt(mode, org.keycloak.common.util.Time.currentTimeMillis());
+            realm.updateComponent(current);
+        });
+        return state;
+    }
+
+    private void persistSyncState(KeycloakSessionFactory sessionFactory, String realmId, String modelId,
+                                  SyncMode mode, Consumer<UserStorageProviderModel> update) {
+        KeycloakModelUtils.runJobInTransaction(sessionFactory, session -> {
+            RealmModel realm = session.realms().getRealm(realmId);
+            if (realm == null) {
+                return;
+            }
+            session.getContext().setRealm(realm);
+            ComponentModel component = realm.getComponent(modelId);
+            if (component == null) {
+                return;
+            }
+            UserStorageProviderModel current = new UserStorageProviderModel(component);
+            update.accept(current);
+            realm.updateComponent(current);
+        });
+    }
+
+    private void updateProgress(SynchronizationResult result, SyncState state, String phase) {
+        state.remaining = remaining(state);
+        result.setProcessed(state.processed);
+        result.setTotal(state.total);
+        result.setRemaining(state.remaining);
+        result.setCursor(state.cursor);
+        result.setPhase(phase);
+    }
+
+    private static int remaining(SyncState state) {
+        return state.total < 0 ? -1 : Math.max(state.total - state.processed, 0);
+    }
+
+    private int countUsers(KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model) {
+        try (LDAPQuery countQuery = createQuery(sessionFactory, realmId, model)) {
+            return countQuery.getResultCount();
+        } catch (Throwable t) {
+            logger.warnf(t, "Unable to determine total number of LDAP users for synchronization progress");
+            return -1;
+        }
+    }
+
+    private String encodeCursor(byte[] cursor) {
+        return cursor == null ? null : Base64.getUrlEncoder().withoutPadding().encodeToString(cursor);
+    }
+
+    private byte[] decodeCursor(String cursor) {
+        return cursor == null ? null : Base64.getUrlDecoder().decode(cursor);
     }
 
     /**
@@ -743,105 +997,204 @@ public class LDAPStorageProviderFactory implements UserStorageProviderFactory<LD
         return queryHolder.query;
     }
 
-    protected SynchronizationResult importLdapUsers(KeycloakSessionFactory sessionFactory, final String realmId, final ComponentModel fedModel, List<LDAPObject> ldapUsers) {
+    protected SynchronizationResult importLdapUsers(KeycloakSessionFactory sessionFactory, final String realmId,
+                                                    final ComponentModel fedModel, List<LDAPObject> ldapUsers,
+                                                    String runId) {
         final SynchronizationResult syncResult = new SynchronizationResult();
 
-        class BooleanHolder {
-            private boolean value = true;
-        }
-        final BooleanHolder exists = new BooleanHolder();
-
         for (final LDAPObject ldapUser : ldapUsers) {
+            class BooleanHolder {
+                private boolean value = true;
+            }
+            final BooleanHolder exists = new BooleanHolder();
+            final List<SyncConflict> userConflicts = new ArrayList<>();
 
             try {
+                // Process each user in its own transaction to avoid aborting the whole batch.
+                KeycloakModelUtils.runJobInTransaction(sessionFactory, session -> {
+                    LDAPStorageProvider ldapFedProvider = (LDAPStorageProvider) session.getProvider(UserStorageProvider.class, fedModel);
+                    RealmModel currentRealm = session.realms().getRealm(realmId);
+                    session.getContext().setRealm(currentRealm);
 
-                // Process each user in it's own transaction to avoid global fail
-                KeycloakModelUtils.runJobInTransaction(sessionFactory, new KeycloakSessionTask() {
-
-                    @Override
-                    public void run(KeycloakSession session) {
-                        LDAPStorageProvider ldapFedProvider = (LDAPStorageProvider)session.getProvider(UserStorageProvider.class, fedModel);
-                        RealmModel currentRealm = session.realms().getRealm(realmId);
-                        session.getContext().setRealm(currentRealm);
-
-                        String username = LDAPUtils.getUsername(ldapUser, ldapFedProvider.getLdapIdentityStore().getConfig());
-                        exists.value = true;
-                        LDAPUtils.checkUuid(ldapUser, ldapFedProvider.getLdapIdentityStore().getConfig());
-                        UserModel currentUserLocal = UserStoragePrivateUtil.userLocalStorage(session).getUserByUsername(currentRealm, username);
-                        Optional<UserModel> userModelOptional = UserStoragePrivateUtil.userLocalStorage(session)
-                                .searchForUserByUserAttributeStream(currentRealm, LDAPConstants.LDAP_ID, ldapUser.getUuid())
-                                .findFirst();
-                        if (!userModelOptional.isPresent() && currentUserLocal == null) {
-                            // Add new user to Keycloak
-                            exists.value = false;
-                            ldapFedProvider.importUserFromLDAP(session, currentRealm, ldapUser);
-                            syncResult.increaseAdded();
-
-                        } else {
-                            UserModel currentUser = userModelOptional.isPresent() ? userModelOptional.get() : currentUserLocal;
-                            if ((fedModel.getId().equals(currentUser.getFederationLink())) && (ldapUser.getUuid().equals(currentUser.getFirstAttribute(LDAPConstants.LDAP_ID)))) {
-
-                                // Update keycloak user
-                                LDAPMappersComparator ldapMappersComparator = new LDAPMappersComparator(ldapFedProvider.getLdapIdentityStore().getConfig());
-                                currentRealm.getComponentsStream(fedModel.getId(), LDAPStorageMapper.class.getName())
-                                        .sorted(ldapMappersComparator.sortDesc())
-                                        .forEachOrdered(mapperModel -> {
-                                            LDAPStorageMapper ldapMapper = ldapFedProvider.getMapperManager().getMapper(mapperModel);
-                                            ldapMapper.onImportUserFromLDAP(ldapUser, currentUser, currentRealm, false);
-                                        });
-
-                                UserCache userCache = UserStorageUtil.userCache(session);
-                                if (userCache != null) {
-                                    userCache.evict(currentRealm, currentUser);
-                                }
-                                logger.debugf("Updated user from LDAP: %s", currentUser.getUsername());
-                                syncResult.increaseUpdated();
-                            } else {
-                                logger.warnf("User with ID '%s' is not updated during sync as he already exists in Keycloak database but is not linked to federation provider '%s'", ldapUser.getUuid(), fedModel.getName());
-                                syncResult.increaseFailed();
+                    String username = LDAPUtils.getUsername(ldapUser, ldapFedProvider.getLdapIdentityStore().getConfig());
+                    exists.value = true;
+                    LDAPUtils.checkUuid(ldapUser, ldapFedProvider.getLdapIdentityStore().getConfig());
+                    UserModel currentUserLocal = UserStoragePrivateUtil.userLocalStorage(session).getUserByUsername(currentRealm, username);
+                    Optional<UserModel> userModelOptional = UserStoragePrivateUtil.userLocalStorage(session)
+                            .searchForUserByUserAttributeStream(currentRealm, LDAPConstants.LDAP_ID, ldapUser.getUuid())
+                            .findFirst();
+                    if (userModelOptional.isEmpty() && currentUserLocal == null) {
+                        exists.value = false;
+                        UserModel imported = ldapFedProvider.importUserFromLDAP(session, currentRealm, ldapUser);
+                        if (runId != null) {
+                            imported.setSingleAttribute(UserSyncMetadata.SEEN_RUN_ATTRIBUTE, runId);
+                        }
+                        syncResult.increaseAdded();
+                    } else {
+                        UserModel currentUser = userModelOptional.isPresent() ? userModelOptional.get() : currentUserLocal;
+                        if (fedModel.getId().equals(currentUser.getFederationLink())
+                                && ldapUser.getUuid().equals(currentUser.getFirstAttribute(LDAPConstants.LDAP_ID))) {
+                            if (runId != null) {
+                                currentUser.setSingleAttribute(UserSyncMetadata.SEEN_RUN_ATTRIBUTE, runId);
                             }
+                            if (currentUser.getFirstAttribute(UserSyncMetadata.DELETED_AT_ATTRIBUTE) != null) {
+                                currentUser.setEnabled(true);
+                                currentUser.removeAttribute(UserSyncMetadata.DELETED_AT_ATTRIBUTE);
+                                currentUser.removeAttribute(UserSyncMetadata.DELETED_BY_ATTRIBUTE);
+                            }
+
+                            LDAPMappersComparator ldapMappersComparator = new LDAPMappersComparator(ldapFedProvider.getLdapIdentityStore().getConfig());
+                            currentRealm.getComponentsStream(fedModel.getId(), LDAPStorageMapper.class.getName())
+                                    .sorted(ldapMappersComparator.sortDesc())
+                                    .forEachOrdered(mapperModel -> {
+                                        LDAPStorageMapper ldapMapper = ldapFedProvider.getMapperManager().getMapper(mapperModel);
+                                        ldapMapper.resetImportConflicts();
+                                        ldapMapper.onImportUserFromLDAP(ldapUser, currentUser, currentRealm, false);
+                                        userConflicts.addAll(ldapMapper.getImportConflicts());
+                                    });
+
+                            UserCache userCache = UserStorageUtil.userCache(session);
+                            if (userCache != null) {
+                                userCache.evict(currentRealm, currentUser);
+                            }
+                            logger.debugf("Updated user from LDAP: %s", currentUser.getUsername());
+                            syncResult.increaseUpdated();
+                        } else {
+                            logger.warnf("User with ID '%s' is not updated during sync as he already exists in Keycloak database but is not linked to federation provider '%s'", ldapUser.getUuid(), fedModel.getName());
+                            syncResult.increaseNonRetryableFailure();
+                            syncResult.increaseSkipped();
                         }
                     }
-
                 });
-            } catch (ModelException me) {
-                logger.error("Failed during import user from LDAP", me);
-                syncResult.increaseFailed();
 
-                // Remove user if we already added him during this transaction
-                if (!exists.value) {
-                    KeycloakModelUtils.runJobInTransaction(sessionFactory, new KeycloakSessionTask() {
-
-                        @Override
-                        public void run(KeycloakSession session) {
-                            LDAPStorageProvider ldapFedProvider = (LDAPStorageProvider)session.getProvider(UserStorageProvider.class, fedModel);
-                            RealmModel currentRealm = session.realms().getRealm(realmId);
-                            session.getContext().setRealm(currentRealm);
-
-                            String username = null;
-                            try {
-                                username = LDAPUtils.getUsername(ldapUser, ldapFedProvider.getLdapIdentityStore().getConfig());
-                            } catch (ModelException ignore) {
-                            }
-
-                            if (username != null) {
-                                UserModel existing = UserStoragePrivateUtil.userLocalStorage(session).getUserByUsername(currentRealm, username);
-                                if (existing != null) {
-                                    UserCache userCache = UserStorageUtil.userCache(session);
-                                    if (userCache != null) {
-                                        userCache.evict(currentRealm, existing);
-                                    }
-                                    UserStoragePrivateUtil.userLocalStorage(session).removeUser(currentRealm, existing);
-                                }
-                            }
-                        }
-
-                    });
+                for (SyncConflict conflict : userConflicts) {
+                    syncResult.addConflict(conflict);
+                }
+            } catch (Throwable t) {
+                addFailure(syncResult, t, "importing LDAP user " + ldapUser.getDn());
+                cleanupFailedNewUser(sessionFactory, realmId, fedModel, ldapUser, exists.value);
+                if (syncResult.isRetryable()) {
+                    break;
                 }
             }
         }
 
         return syncResult;
+    }
+
+    protected SynchronizationResult importLdapUsers(KeycloakSessionFactory sessionFactory, String realmId,
+                                                    ComponentModel fedModel, List<LDAPObject> ldapUsers) {
+        return importLdapUsers(sessionFactory, realmId, fedModel, ldapUsers, UUID.randomUUID().toString());
+    }
+
+    private void cleanupFailedNewUser(KeycloakSessionFactory sessionFactory, String realmId, ComponentModel fedModel,
+                                      LDAPObject ldapUser, boolean existedBefore) {
+        if (existedBefore) {
+            return;
+        }
+        try {
+            KeycloakModelUtils.runJobInTransaction(sessionFactory, session -> {
+                LDAPStorageProvider ldapFedProvider = (LDAPStorageProvider) session.getProvider(UserStorageProvider.class, fedModel);
+                RealmModel currentRealm = session.realms().getRealm(realmId);
+                session.getContext().setRealm(currentRealm);
+
+                String username = null;
+                try {
+                    username = LDAPUtils.getUsername(ldapUser, ldapFedProvider.getLdapIdentityStore().getConfig());
+                } catch (ModelException ignore) {
+                }
+                if (username == null) {
+                    return;
+                }
+                UserModel existing = UserStoragePrivateUtil.userLocalStorage(session).getUserByUsername(currentRealm, username);
+                if (existing != null) {
+                    UserCache userCache = UserStorageUtil.userCache(session);
+                    if (userCache != null) {
+                        userCache.evict(currentRealm, existing);
+                    }
+                    UserStoragePrivateUtil.userLocalStorage(session).removeUser(currentRealm, existing);
+                }
+            });
+        } catch (Throwable t) {
+            logger.warnf(t, "Unable to clean up partially imported LDAP user %s", ldapUser.getDn());
+        }
+    }
+
+    private SynchronizationResult disableDeletedUsers(KeycloakSessionFactory sessionFactory, String realmId,
+                                                      ComponentModel fedModel, String runId) {
+        SynchronizationResult result = new SynchronizationResult();
+        LDAPConfig config = new LDAPConfig(fedModel.getConfig());
+        if (!LDAPConfig.SYNC_DELETION_DISABLE.equals(config.getSyncDeletionMode())) {
+            return result;
+        }
+
+        KeycloakModelUtils.runJobInTransaction(sessionFactory, session -> {
+            RealmModel realm = session.realms().getRealm(realmId);
+            if (realm == null) {
+                return;
+            }
+            session.getContext().setRealm(realm);
+            UserStoragePrivateUtil.userLocalStorage(session).searchForUserStream(realm, Collections.emptyMap())
+                    .forEach(user -> {
+                        if (!fedModel.getId().equals(user.getFederationLink()) || !user.isEnabled()) {
+                            return;
+                        }
+                        if (user.getFirstAttribute(LDAPConstants.LDAP_ID) == null) {
+                            return;
+                        }
+                        String seenRun = user.getFirstAttribute(UserSyncMetadata.SEEN_RUN_ATTRIBUTE);
+                        if (seenRun == null || runId.equals(seenRun)) {
+                            return;
+                        }
+                        long now = org.keycloak.common.util.Time.currentTimeMillis();
+                        user.setEnabled(false);
+                        user.setSingleAttribute(UserSyncMetadata.DELETED_AT_ATTRIBUTE, Long.toString(now));
+                        user.setSingleAttribute(UserSyncMetadata.DELETED_BY_ATTRIBUTE, "directory-sync:" + fedModel.getName());
+                        UserCache userCache = UserStorageUtil.userCache(session);
+                        if (userCache != null) {
+                            userCache.evict(realm, user);
+                        }
+                        result.increaseDisabled();
+                        logger.warnf("Disabled user '%s' because it no longer exists in LDAP. Local data and resource references were preserved.",
+                                user.getUsername());
+                    });
+        });
+        return result;
+    }
+
+    private void addFailure(SynchronizationResult result, Throwable throwable, String operation) {
+        boolean retryable = isRetryableFailure(throwable);
+        if (retryable) {
+            result.increaseRetryableFailure();
+        } else {
+            result.increaseNonRetryableFailure();
+            result.increaseSkipped();
+        }
+        logger.warnf(throwable, "Failed %s during LDAP synchronization (%s)", operation,
+                retryable ? "retryable" : "non-retryable");
+    }
+
+    private boolean isRetryableFailure(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof StorageUnavailableException
+                    || current instanceof CommunicationException
+                    || current instanceof NamingException
+                    || current instanceof java.io.IOException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    protected static final class SyncState {
+        private boolean resumed;
+        private String runId;
+        private String cursor;
+        private int processed;
+        private int total = -1;
+        private int remaining = -1;
     }
 
     protected SPNEGOAuthenticator createSPNEGOAuthenticator(String spnegoToken, CommonKerberosConfig kerberosConfig) {

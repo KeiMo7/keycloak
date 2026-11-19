@@ -130,6 +130,17 @@ public interface Details {
     String CLIENT_POLICY_ERROR = "client_policy_error";
     String CLIENT_POLICY_ERROR_DETAIL = "client_policy_error_detail";
 
+    String SYNC_ACTION = "sync_action";
+    String SYNC_ATTRIBUTE = "sync_attribute";
+    String SYNC_POLICY = "sync_policy";
+    String SYNC_WINNER = "sync_winner";
+    String SYNC_DIRECTORY_VALUE = "sync_directory_value";
+    String SYNC_LOCAL_VALUE = "sync_local_value";
+    String SYNC_LOCAL_MODIFIED_AT = "sync_local_modified_at";
+    String SYNC_LOCAL_MODIFIED_BY = "sync_local_modified_by";
+    String SYNC_DIRECTORY_MODIFIED_AT = "sync_directory_modified_at";
+    String SYNC_DETECTED_AT = "sync_detected_at";
+
     String USER_SESSION_EXPIRED_REASON = "user_session_expired";
     String INVALID_USER_SESSION_REMEMBER_ME_REASON = "invalid_user_session_remember_me";
 

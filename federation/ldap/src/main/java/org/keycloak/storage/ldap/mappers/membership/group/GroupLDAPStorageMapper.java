@@ -56,6 +56,7 @@ import org.keycloak.storage.ldap.mappers.membership.LDAPGroupMapperMode;
 import org.keycloak.storage.ldap.mappers.membership.MembershipType;
 import org.keycloak.storage.ldap.mappers.membership.UserRolesRetrieveStrategy;
 import org.keycloak.storage.user.SynchronizationResult;
+import org.keycloak.storage.user.UserSyncMetadata;
 
 import org.jboss.logging.Logger;
 
@@ -205,6 +206,7 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
                 RealmModel innerTransactionRealm = session.realms().getRealm(realm.getId());
                 GroupModel innerTransactionGroup = session.groups().getGroupById(innerTransactionRealm, kcExistingGroup.getId());
                 updateAttributesOfKCGroup(innerTransactionGroup, groupEntry.getValue());
+                markDirectoryManaged(innerTransactionGroup);
                 syncResult.increaseUpdated();
                 visitedGroupIds.add(kcExistingGroup.getId());
             });
@@ -224,6 +226,7 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
                 RealmModel innerTransactionRealm = session.realms().getRealm(realm.getId());
                 GroupModel kcGroup = createKcGroup(innerTransactionRealm, groupName, null);
                 updateAttributesOfKCGroup(kcGroup, groupEntry.getValue());
+                markDirectoryManaged(kcGroup);
                 syncResult.increaseAdded();
                 visitedGroupIds.add(kcGroup.getId());
             });
@@ -319,6 +322,7 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
         if (kcGroup != null) {
             logger.debugf("Updated Keycloak group '%s' from LDAP", kcGroup.getName());
             updateAttributesOfKCGroup(kcGroup, ldapGroups.get(kcGroup.getName()));
+            markDirectoryManaged(kcGroup);
             syncResult.increaseUpdated();
         } else {
             kcGroup = createKcGroup(realm, groupTreeEntry.getGroupName(), kcParent);
@@ -329,6 +333,7 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
             }
 
             updateAttributesOfKCGroup(kcGroup, ldapGroups.get(kcGroup.getName()));
+            markDirectoryManaged(kcGroup);
             syncResult.increaseAdded();
         }
 
@@ -343,13 +348,31 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
         // Remove keycloak groups, which don't exist in LDAP
         GroupModel parent = getKcGroupsPathGroup(realm);
 
-        getAllKcGroups(realm, parent)
+        List<GroupModel> groupsToRemove = getAllKcGroups(realm, parent)
+                .filter(kcGroup -> !trackGroupOwnership() || isDirectoryManaged(kcGroup))
                 .filter(kcGroup -> !visitedGroupIds.contains(kcGroup.getId()))
-                .forEach(kcGroup -> {
-                    logger.debugf("Removing Keycloak group '%s', which doesn't exist in LDAP", kcGroup.getName());
-                    realm.removeGroup(kcGroup);
-                    syncResult.increaseRemoved();
-                });
+                .collect(Collectors.toList());
+        groupsToRemove.sort((left, right) -> Integer.compare(groupDepth(right), groupDepth(left)));
+
+        for (GroupModel kcGroup : groupsToRemove) {
+            // Keycloak recursively removes subgroups. Keep local or still-present directory children
+            // by moving them to the removed group's parent before deleting it.
+            for (GroupModel child : kcGroup.getSubGroupsStream().collect(Collectors.toList())) {
+                child.setParent(kcGroup.getParent());
+            }
+            logger.debugf("Removing Keycloak group '%s', which doesn't exist in LDAP", kcGroup.getName());
+            realm.removeGroup(kcGroup);
+            syncResult.increaseRemoved();
+        }
+    }
+
+    private int groupDepth(GroupModel group) {
+        int depth = 0;
+        while (group.getParent() != null) {
+            depth++;
+            group = group.getParent();
+        }
+        return depth;
     }
 
     private void updateAttributesOfKCGroup(GroupModel kcGroup, LDAPObject ldapGroup) {
@@ -370,6 +393,21 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
                 kcGroup.setAttribute(attrName, new LinkedList<>(attrValues));
             }
         }
+    }
+
+    private void markDirectoryManaged(GroupModel group) {
+        if (trackGroupOwnership()) {
+            group.setAttribute(UserSyncMetadata.GROUP_OWNER_ATTRIBUTE, List.of(mapperModel.getId()));
+        }
+    }
+
+    private boolean isDirectoryManaged(GroupModel group) {
+        return trackGroupOwnership()
+                && mapperModel.getId().equals(group.getFirstAttribute(UserSyncMetadata.GROUP_OWNER_ATTRIBUTE));
+    }
+
+    private boolean trackGroupOwnership() {
+        return ldapProvider.getLdapIdentityStore().getConfig().isSyncGroupOwnershipEnabled();
     }
 
 
@@ -405,6 +443,7 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
 
                 kcGroup = createKcGroup(realm, groupName, null);
                 updateAttributesOfKCGroup(kcGroup, ldapGroup);
+                markDirectoryManaged(kcGroup);
             }
 
             // Could theoretically happen on some LDAP servers if 'memberof' style is used and 'memberof' attribute of user references non-existing group
@@ -412,6 +451,8 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
                 String groupName = ldapGroup.getAttributeAsString(config.getGroupNameLdapAttribute());
                 logger.warnf("User '%s' is member of group '%s', which doesn't exist in LDAP", user.getUsername(), groupName);
             }
+        } else {
+            markDirectoryManaged(kcGroup);
         }
 
         return kcGroup;
@@ -718,18 +759,23 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
         @Override
         public Stream<GroupModel> getGroupsStream() {
             Stream<GroupModel> ldapGroupMappings = getLDAPGroupMappingsConverted();
-            if (config.isTopLevelGroupsPath() && config.getMode() == LDAPGroupMapperMode.LDAP_ONLY) {
-                // Use just group mappings from LDAP
-                return ldapGroupMappings;
-            } else {
-                // Merge mappings from both DB and LDAP (including groups assigned from other group mappers)
+            if (!trackGroupOwnership()) {
+                if (config.isTopLevelGroupsPath() && config.getMode() == LDAPGroupMapperMode.LDAP_ONLY) {
+                    return ldapGroupMappings;
+                }
                 return Stream.concat(ldapGroupMappings, super.getGroupsStream());
             }
+            // Directory-managed memberships are read from LDAP. Locally managed groups stay in the local store
+            // and must survive every synchronization.
+            Stream<GroupModel> localGroupMappings = super.getGroupsStream()
+                    .filter(group -> !isDirectoryManaged(group));
+            return Stream.concat(ldapGroupMappings, localGroupMappings);
         }
 
         @Override
         public void joinGroup(GroupModel group) {
-            if (config.getMode() == LDAPGroupMapperMode.LDAP_ONLY && isGroupInGroupPath(realm, group)) {
+            boolean managed = !trackGroupOwnership() || isDirectoryManaged(group);
+            if (config.getMode() == LDAPGroupMapperMode.LDAP_ONLY && isGroupInGroupPath(realm, group) && managed) {
                 // We need to create new role mappings in LDAP
                 cachedLDAPGroupMappings = null;
                 addGroupMappingInLDAP(realm, group, ldapUser);
@@ -741,7 +787,8 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
         @Override
         public void leaveGroup(GroupModel group) {
             // if user is leaving group not managed by this mapper, let the call proceed to the next mapper or to the DB.
-            if (!isGroupInGroupPath(realm, group)) {
+            boolean managed = !trackGroupOwnership() || isDirectoryManaged(group);
+            if (!isGroupInGroupPath(realm, group) || !managed) {
                 super.leaveGroup(group);
                 return;
             }
@@ -777,7 +824,8 @@ public class GroupLDAPStorageMapper extends AbstractLDAPStorageMapper implements
 
         @Override
         public boolean isMemberOf(GroupModel group) {
-            if (!isGroupInGroupPath(realm, group)) {
+            boolean managed = !trackGroupOwnership() || isDirectoryManaged(group);
+            if (!isGroupInGroupPath(realm, group) || !managed) {
                 // this mapper doesn't manage the group - delegate to the next mapper or the JPA store.
                 return super.isMemberOf(group);
             }

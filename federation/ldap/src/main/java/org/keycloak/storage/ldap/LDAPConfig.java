@@ -36,6 +36,14 @@ import static org.keycloak.storage.UserStorageProviderModel.IMPORT_ENABLED;
 public class LDAPConfig {
 
     public static final String DEFAULT_CONNECTION_TIMEOUT = "5000";
+    public static final String SYNC_ATTRIBUTE_PRIORITIES = "sync.attribute.priorities";
+    public static final String SYNC_DELETION_MODE = "sync.deletion.mode";
+    public static final String SYNC_GROUP_OWNERSHIP = "sync.group.ownership";
+    public static final String SYNC_DELETION_LEGACY = "LEGACY";
+    public static final String SYNC_DELETION_DISABLE = "DISABLE";
+    public static final String SYNC_PRIORITY_DIRECTORY = "DIRECTORY";
+    public static final String SYNC_PRIORITY_LOCAL = "LOCAL";
+    public static final String SYNC_PRIORITY_LEGACY = "LEGACY";
 
     private final MultivaluedHashMap<String, String> config;
     private final Set<String> binaryAttributeNames = new HashSet<>();
@@ -297,6 +305,40 @@ public class LDAPConfig {
 
     public boolean isImportEnabled() {
         return Boolean.parseBoolean(config.getFirstOrDefault(IMPORT_ENABLED, Boolean.TRUE.toString())) ;
+    }
+
+    /**
+     * Returns the configured conflict priority for a user model field. The value is configured as a
+     * comma or semicolon separated list, for example {@code email=DIRECTORY,phone=LOCAL}.
+     */
+    public String getSyncAttributePriority(String field) {
+        String priorities = config.getFirst(SYNC_ATTRIBUTE_PRIORITIES);
+        if (priorities == null || priorities.isBlank() || field == null) {
+            return SYNC_PRIORITY_LEGACY;
+        }
+
+        for (String entry : priorities.split("[,;\\n]")) {
+            String[] parts = entry.split("=", 2);
+            if (parts.length != 2) {
+                continue;
+            }
+            if (field.equalsIgnoreCase(parts[0].trim())) {
+                String priority = parts[1].trim().toUpperCase();
+                if (SYNC_PRIORITY_DIRECTORY.equals(priority) || SYNC_PRIORITY_LOCAL.equals(priority)) {
+                    return priority;
+                }
+            }
+        }
+        return SYNC_PRIORITY_LEGACY;
+    }
+
+    public String getSyncDeletionMode() {
+        String mode = config.getFirst(SYNC_DELETION_MODE);
+        return mode == null || mode.isBlank() ? SYNC_DELETION_LEGACY : mode.trim().toUpperCase();
+    }
+
+    public boolean isSyncGroupOwnershipEnabled() {
+        return Boolean.parseBoolean(config.getFirstOrDefault(SYNC_GROUP_OWNERSHIP, Boolean.TRUE.toString()));
     }
 
     @Override

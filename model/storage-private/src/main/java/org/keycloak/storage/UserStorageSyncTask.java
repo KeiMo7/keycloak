@@ -72,9 +72,12 @@ final class UserStorageSyncTask implements ScheduledTask {
             };
         } catch (Throwable t) {
             logger.errorf(t, "Error occurred during %s users-sync in realm %s and user provider %s",  syncMode, realmId, providerId);
+            SynchronizationResult result = SynchronizationResult.empty();
+            result.increaseRetryableFailure();
+            result.setRetryable(true);
+            result.setPhase("RETRYING");
+            return result;
         }
-
-        return SynchronizationResult.empty();
     }
 
     boolean schedule(KeycloakSession session) {
@@ -175,7 +178,7 @@ final class UserStorageSyncTask implements ScheduledTask {
             // Need to load component again in this transaction for updated data
             SynchronizationResult result = syncFunction.apply(sessionFactory, factory, provider);
 
-            if (!result.isIgnored()) {
+            if (!result.isIgnored() && !result.isRetryable()) {
                 KeycloakModelUtils.runJobInTransaction(sessionFactory, s -> {
                     RealmModel realm = s.realms().getRealm(realmId);
                     s.getContext().setRealm(realm);

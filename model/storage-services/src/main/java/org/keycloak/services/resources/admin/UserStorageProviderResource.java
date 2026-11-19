@@ -38,6 +38,7 @@ import org.keycloak.events.admin.OperationType;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
+import org.keycloak.representations.idm.SynchronizationResultRepresentation;
 import org.keycloak.services.ErrorResponse;
 import org.keycloak.services.ServicesLogger;
 import org.keycloak.services.managers.LDAPServerCapabilitiesManager;
@@ -45,6 +46,8 @@ import org.keycloak.services.resources.admin.fgap.AdminPermissionEvaluator;
 import org.keycloak.storage.UserStoragePrivateUtil;
 import org.keycloak.storage.UserStorageProvider;
 import org.keycloak.storage.UserStorageProviderModel;
+import org.keycloak.storage.UserStorageProviderModel.SyncMode;
+import org.keycloak.storage.UserStorageProviderModel.SyncStatus;
 import org.keycloak.storage.ldap.mappers.LDAPStorageMapper;
 import org.keycloak.storage.user.SynchronizationResult;
 
@@ -181,6 +184,39 @@ public class UserStorageProviderResource {
         adminEvent.operation(OperationType.ACTION).resourcePath(session.getContext().getUri()).representation(eventRep).success();
 
         return syncResult;
+    }
+
+    /**
+     * Return the persisted progress of the current or most recent user synchronization.
+     */
+    @GET
+    @Path("{id}/sync/status")
+    @NoCache
+    @Produces(MediaType.APPLICATION_JSON)
+    public SynchronizationResultRepresentation getSyncStatus(@PathParam("id") String id) {
+        auth.users().requireManage();
+
+        ComponentModel component = realm.getComponent(id);
+        if (component == null || !component.getProviderType().equals(UserStorageProvider.class.getName())) {
+            throw new NotFoundException("Could not find user storage provider");
+        }
+
+        UserStorageProviderModel provider = new UserStorageProviderModel(component);
+        SyncMode mode = provider.getSyncStatus(SyncMode.FULL) == SyncStatus.RUNNING
+                || provider.getSyncStatus(SyncMode.FULL) == SyncStatus.FAILED
+                ? SyncMode.FULL : SyncMode.CHANGED;
+
+        SynchronizationResultRepresentation representation = new SynchronizationResultRepresentation();
+        representation.setProcessed(provider.getSyncProcessed(mode));
+        representation.setTotal(provider.getSyncTotal(mode));
+        representation.setRemaining(provider.getSyncRemaining(mode));
+        representation.setPhase(provider.getSyncPhase(mode));
+        representation.setCursor(provider.getSyncCursor(mode));
+        representation.setRetryable(provider.isSyncRetryable(mode));
+        representation.setStatus(String.format("%s: processed %d, remaining %d, phase %s",
+                provider.getSyncStatus(mode), representation.getProcessed(), representation.getRemaining(),
+                representation.getPhase() == null ? "IDLE" : representation.getPhase()));
+        return representation;
     }
 
     /**

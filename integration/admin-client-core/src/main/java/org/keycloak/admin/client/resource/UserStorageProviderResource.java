@@ -16,6 +16,7 @@
  */
 package org.keycloak.admin.client.resource;
 
+import jakarta.ws.rs.GET;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
@@ -44,6 +45,11 @@ public interface UserStorageProviderResource {
     @Path("{componentId}/sync")
     @Produces(MediaType.APPLICATION_JSON)
     SynchronizationResultRepresentation syncUsers(@PathParam("componentId") String componentId, @QueryParam("action") String action);
+
+    @GET
+    @Path("{componentId}/sync/status")
+    @Produces(MediaType.APPLICATION_JSON)
+    SynchronizationResultRepresentation getSyncStatus(@PathParam("componentId") String componentId);
 
     /**
      * Remove imported users

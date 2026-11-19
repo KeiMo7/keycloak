@@ -17,6 +17,12 @@
 
 package org.keycloak.storage.ldap.mappers;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
+
 import org.keycloak.common.util.MultivaluedHashMap;
 import org.keycloak.component.ComponentModel;
 import org.keycloak.models.LDAPConstants;
@@ -26,6 +32,8 @@ import org.keycloak.storage.ldap.LDAPConfig;
 import org.keycloak.storage.ldap.LDAPStorageProvider;
 import org.keycloak.storage.ldap.idm.model.LDAPObject;
 import org.keycloak.storage.ldap.idm.store.ldap.LDAPIdentityStore;
+import org.keycloak.storage.user.SyncConflict;
+import org.keycloak.storage.user.UserSyncMetadata;
 
 import org.junit.Assert;
 import org.junit.Test;
@@ -75,5 +83,106 @@ public class UserAttributeLDAPStorageMapperTest {
         String decodedGuid = proxied.getFirstAttribute("customGuid");
 
         Assert.assertEquals("581f7154-d23a-4ac3-ab97-d344ed178cdc", decodedGuid);
+    }
+
+    @Test
+    public void testDirectoryPriorityWinsAndCreatesAuditWhenBothSidesChanged() {
+        TestUser user = new TestUser("local-phone");
+        UserSyncMetadata.setBaseline(user, "phone", List.of("directory-old"));
+
+        UserAttributeLDAPStorageMapper mapper = createMapper(LDAPConfig.SYNC_PRIORITY_DIRECTORY);
+        LDAPObject ldapUser = new LDAPObject();
+        ldapUser.setSingleAttribute("telephoneNumber", "directory-new");
+        ldapUser.setSingleAttribute(LDAPConstants.MODIFY_TIMESTAMP, "20261120101010Z");
+
+        mapper.onImportUserFromLDAP(ldapUser, user, null, false);
+
+        Assert.assertEquals("directory-new", user.getFirstAttribute("phone"));
+        Assert.assertEquals(1, mapper.getImportConflicts().size());
+        SyncConflict conflict = mapper.getImportConflicts().get(0);
+        Assert.assertEquals(LDAPConfig.SYNC_PRIORITY_DIRECTORY, conflict.getPolicy());
+        Assert.assertEquals(LDAPConfig.SYNC_PRIORITY_DIRECTORY, conflict.getWinner());
+        Assert.assertEquals("local-phone", conflict.getLocalValue());
+        Assert.assertEquals("directory-new", conflict.getDirectoryValue());
+        Assert.assertFalse(user.getAttributeStream(UserSyncMetadata.auditAttribute("phone")).toList().isEmpty());
+    }
+
+    @Test
+    public void testLocalPriorityKeepsLocalValueWhenBothSidesChanged() {
+        TestUser user = new TestUser("local-phone");
+        UserSyncMetadata.setBaseline(user, "phone", List.of("directory-old"));
+
+        UserAttributeLDAPStorageMapper mapper = createMapper(LDAPConfig.SYNC_PRIORITY_LOCAL);
+        LDAPObject ldapUser = new LDAPObject();
+        ldapUser.setSingleAttribute("telephoneNumber", "directory-new");
+
+        mapper.onImportUserFromLDAP(ldapUser, user, null, false);
+
+        Assert.assertEquals("local-phone", user.getFirstAttribute("phone"));
+        Assert.assertEquals(1, mapper.getImportConflicts().size());
+        Assert.assertEquals(LDAPConfig.SYNC_PRIORITY_LOCAL, mapper.getImportConflicts().get(0).getWinner());
+        Assert.assertEquals("directory-new", UserSyncMetadata.getBaseline(user, "phone").get(0));
+    }
+
+    private UserAttributeLDAPStorageMapper createMapper(String priority) {
+        MultivaluedHashMap<String, String> ldapConfigMap = new MultivaluedHashMap<>();
+        LDAPIdentityStore ldapIdentityStore = new LDAPIdentityStore(null, new LDAPConfig(ldapConfigMap));
+        LDAPStorageProvider ldapProvider = new LDAPStorageProvider(null, null, new ComponentModel(), ldapIdentityStore);
+
+        ComponentModel mapperModel = new ComponentModel();
+        mapperModel.getConfig().putSingle(UserAttributeLDAPStorageMapper.USER_MODEL_ATTRIBUTE, "phone");
+        mapperModel.getConfig().putSingle(UserAttributeLDAPStorageMapper.LDAP_ATTRIBUTE, "telephoneNumber");
+        mapperModel.getConfig().putSingle(UserAttributeLDAPStorageMapper.SYNC_PRIORITY, priority);
+        return new UserAttributeLDAPStorageMapper(mapperModel, ldapProvider);
+    }
+
+    private static class TestUser extends UserModelDelegate {
+        private final Map<String, List<String>> attributes = new HashMap<>();
+
+        private TestUser(String phone) {
+            super(null);
+            attributes.put("phone", new ArrayList<>(List.of(phone)));
+        }
+
+        @Override
+        public String getId() {
+            return "user-id";
+        }
+
+        @Override
+        public String getUsername() {
+            return "test-user";
+        }
+
+        @Override
+        public Map<String, List<String>> getAttributes() {
+            return attributes;
+        }
+
+        @Override
+        public Stream<String> getAttributeStream(String name) {
+            return attributes.getOrDefault(name, List.of()).stream();
+        }
+
+        @Override
+        public String getFirstAttribute(String name) {
+            List<String> values = attributes.get(name);
+            return values == null || values.isEmpty() ? null : values.get(0);
+        }
+
+        @Override
+        public void setAttribute(String name, List<String> values) {
+            attributes.put(name, new ArrayList<>(values));
+        }
+
+        @Override
+        public void setSingleAttribute(String name, String value) {
+            attributes.put(name, new ArrayList<>(List.of(value)));
+        }
+
+        @Override
+        public void removeAttribute(String name) {
+            attributes.remove(name);
+        }
     }
 }

@@ -28,7 +28,11 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import org.keycloak.common.util.Time;
 import org.keycloak.component.ComponentModel;
+import org.keycloak.events.Details;
+import org.keycloak.events.EventBuilder;
+import org.keycloak.events.EventType;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.LDAPConstants;
 import org.keycloak.models.ModelDuplicateException;
@@ -49,6 +53,8 @@ import org.keycloak.storage.ldap.idm.model.LDAPObject;
 import org.keycloak.storage.ldap.idm.query.Condition;
 import org.keycloak.storage.ldap.idm.query.internal.LDAPQuery;
 import org.keycloak.storage.ldap.idm.store.ldap.LDAPUtil;
+import org.keycloak.storage.user.SyncConflict;
+import org.keycloak.storage.user.UserSyncMetadata;
 
 import org.jboss.logging.Logger;
 
@@ -75,6 +81,9 @@ public class UserAttributeLDAPStorageMapper extends AbstractLDAPStorageMapper {
     public static final String BINARY_DECODER_UUID = "uuid";
     public static final String ATTRIBUTE_DEFAULT_VALUE = "attribute.default.value";
     public static final String FORCE_DEFAULT_VALUE = "attribute.force.default";
+    public static final String SYNC_PRIORITY = "sync.priority";
+
+    private final List<SyncConflict> importConflicts = new ArrayList<>();
 
     public UserAttributeLDAPStorageMapper(ComponentModel mapperModel, LDAPStorageProvider ldapProvider) {
         super(mapperModel, ldapProvider);
@@ -91,25 +100,160 @@ public class UserAttributeLDAPStorageMapper extends AbstractLDAPStorageMapper {
         }
 
         Property<Object> userModelProperty = userModelProperties.get(userModelAttrName.toLowerCase());
+        List<String> directoryValues = getDirectoryValues(ldapUser, ldapAttrName, userModelProperty);
+        String priority = getSyncPriority(userModelAttrName);
+
+        if (!LDAPConfig.SYNC_PRIORITY_LEGACY.equals(priority)) {
+            List<String> localValues = getLocalValues(user, userModelAttrName, userModelProperty);
+            String baselineValue = user.getFirstAttribute(UserSyncMetadata.baselineAttribute(userModelAttrName));
+            List<String> baseline = UserSyncMetadata.getBaseline(user, userModelAttrName);
+            boolean baselineKnown = baselineValue != null;
+            boolean localChanged = baselineKnown && !valuesEqual(localValues, baseline);
+            boolean directoryChanged = baselineKnown && !valuesEqual(directoryValues, baseline);
+            boolean valuesConflict = !valuesEqual(localValues, directoryValues)
+                    && (!baselineKnown || (localChanged && directoryChanged));
+
+            String winner;
+            if (valuesConflict) {
+                winner = LDAPConfig.SYNC_PRIORITY_LOCAL.equals(priority)
+                        ? LDAPConfig.SYNC_PRIORITY_LOCAL : LDAPConfig.SYNC_PRIORITY_DIRECTORY;
+                recordConflict(user, realm, ldapUser, userModelAttrName, directoryValues, localValues, priority, winner);
+            } else if (baselineKnown && localChanged && !directoryChanged) {
+                // Only the local value changed. It is not a conflict and must not be erased by an ordinary refresh.
+                winner = LDAPConfig.SYNC_PRIORITY_LOCAL;
+            } else if (!valuesEqual(localValues, directoryValues)) {
+                winner = LDAPConfig.SYNC_PRIORITY_DIRECTORY;
+            } else {
+                winner = LDAPConfig.SYNC_PRIORITY_LOCAL;
+            }
+
+            if (LDAPConfig.SYNC_PRIORITY_DIRECTORY.equals(winner)) {
+                applyDirectoryValue(user, realm, userModelProperty, userModelAttrName, directoryValues);
+            }
+            UserSyncMetadata.setBaseline(user, userModelAttrName, directoryValues);
+            return;
+        }
 
         if (userModelProperty != null) {
-
-            // we have java property on UserModel
-            String ldapAttrValue = ldapUser.getAttributeAsString(ldapAttrName);
-
-            checkDuplicateEmail(userModelAttrName, ldapAttrValue, realm, ldapProvider.getSession(), user);
-
-            setPropertyOnUserModel(userModelProperty, user, ldapAttrValue);
+            applyDirectoryValue(user, realm, userModelProperty, userModelAttrName, directoryValues);
         } else {
+            applyDirectoryValue(user, realm, null, userModelAttrName, directoryValues);
+        }
+    }
 
-            // we don't have java property. Let's set attribute
-            Set<String> ldapAttrValue = ldapUser.getAttributeAsSet(ldapAttrName);
-            if (ldapAttrValue != null) {
-                user.setAttribute(userModelAttrName, new ArrayList<>(ldapAttrValue));
-            } else {
-                user.removeAttribute(userModelAttrName);
+    @Override
+    public List<SyncConflict> getImportConflicts() {
+        return List.copyOf(importConflicts);
+    }
+
+    @Override
+    public void resetImportConflicts() {
+        importConflicts.clear();
+    }
+
+    private List<String> getDirectoryValues(LDAPObject ldapUser, String ldapAttrName, Property<Object> userModelProperty) {
+        if (userModelProperty != null) {
+            String value = ldapUser.getAttributeAsString(ldapAttrName);
+            return value == null ? List.of() : List.of(value);
+        }
+        Set<String> values = ldapUser.getAttributeAsSet(ldapAttrName);
+        return values == null ? List.of() : new ArrayList<>(values);
+    }
+
+    private List<String> getLocalValues(UserModel user, String userModelAttrName, Property<Object> userModelProperty) {
+        if (userModelProperty != null) {
+            Object value = userModelProperty.getValue(user);
+            return value == null ? List.of() : List.of(value.toString());
+        }
+        return user.getAttributeStream(userModelAttrName).toList();
+    }
+
+    private void applyDirectoryValue(UserModel user, RealmModel realm, Property<Object> userModelProperty,
+                                     String userModelAttrName, List<String> directoryValues) {
+        if (userModelProperty != null) {
+            String value = directoryValues.isEmpty() ? null : directoryValues.get(0);
+            checkDuplicateEmail(userModelAttrName, value, realm, ldapProvider.getSession(), user);
+            setPropertyOnUserModel(userModelProperty, user, value);
+        } else if (directoryValues.isEmpty()) {
+            user.removeAttribute(userModelAttrName);
+        } else {
+            user.setAttribute(userModelAttrName, new ArrayList<>(directoryValues));
+        }
+    }
+
+    private String getSyncPriority(String userModelAttrName) {
+        String mapperPriority = mapperModel.getConfig().getFirst(SYNC_PRIORITY);
+        if (mapperPriority != null && !mapperPriority.isBlank()
+                && !LDAPConfig.SYNC_PRIORITY_LEGACY.equalsIgnoreCase(mapperPriority)) {
+            String normalized = mapperPriority.trim().toUpperCase();
+            if (LDAPConfig.SYNC_PRIORITY_DIRECTORY.equals(normalized) || LDAPConfig.SYNC_PRIORITY_LOCAL.equals(normalized)) {
+                return normalized;
             }
         }
+        return ldapProvider.getLdapIdentityStore().getConfig().getSyncAttributePriority(userModelAttrName);
+    }
+
+    private void recordConflict(UserModel user, RealmModel realm, LDAPObject ldapUser, String attribute,
+                                List<String> directoryValues, List<String> localValues,
+                                String policy, String winner) {
+        long now = Time.currentTimeMillis();
+        String localModifiedBy = UserSyncMetadata.getLocalModifiedBy(user, attribute);
+        long localModifiedAt = UserSyncMetadata.getLocalModifiedAt(user, attribute);
+        String directoryModifiedAt = ldapUser.getAttributeAsString(LDAPConstants.MODIFY_TIMESTAMP);
+        String actor = "directory-sync:" + ldapProvider.getModel().getName();
+
+        SyncConflict conflict = new SyncConflict();
+        conflict.setUserId(user.getId());
+        conflict.setUsername(user.getUsername());
+        conflict.setAttribute(attribute);
+        conflict.setDirectoryValue(join(directoryValues));
+        conflict.setLocalValue(join(localValues));
+        conflict.setResolvedValue(LDAPConfig.SYNC_PRIORITY_LOCAL.equals(winner) ? join(localValues) : join(directoryValues));
+        conflict.setPolicy(policy);
+        conflict.setWinner(winner);
+        conflict.setActor(actor);
+        conflict.setLocalModifiedBy(localModifiedBy == null ? "local" : localModifiedBy);
+        conflict.setLocalModifiedAt(localModifiedAt);
+        conflict.setDirectoryModifiedAt(directoryModifiedAt);
+        conflict.setDetectedAt(now);
+        conflict.setRetryable(false);
+        importConflicts.add(conflict);
+
+        String auditEntry = String.format("detectedAt=%d;actor=%s;attribute=%s;policy=%s;winner=%s;directory=%s;local=%s;localModifiedAt=%d;localModifiedBy=%s;directoryModifiedAt=%s",
+                now, actor, attribute, policy, winner, conflict.getDirectoryValue(), conflict.getLocalValue(),
+                localModifiedAt, localModifiedBy == null ? "local" : localModifiedBy,
+                directoryModifiedAt == null ? "" : directoryModifiedAt);
+        List<String> audit = new ArrayList<>(user.getAttributeStream(UserSyncMetadata.auditAttribute(attribute)).toList());
+        audit.add(auditEntry);
+        user.setAttribute(UserSyncMetadata.auditAttribute(attribute), audit);
+
+        if (ldapProvider.getSession() != null) {
+            new EventBuilder(realm, ldapProvider.getSession())
+                    .user(user)
+                    .event(EventType.UPDATE_PROFILE)
+                    .detail(Details.SYNC_ACTION, "attribute_conflict_resolved")
+                    .detail(Details.SYNC_ATTRIBUTE, attribute)
+                    .detail(Details.SYNC_POLICY, policy)
+                    .detail(Details.SYNC_WINNER, winner)
+                    .detail(Details.SYNC_DIRECTORY_VALUE, conflict.getDirectoryValue())
+                    .detail(Details.SYNC_LOCAL_VALUE, conflict.getLocalValue())
+                    .detail(Details.SYNC_LOCAL_MODIFIED_AT, Long.toString(localModifiedAt))
+                    .detail(Details.SYNC_LOCAL_MODIFIED_BY, localModifiedBy == null ? "local" : localModifiedBy)
+                    .detail(Details.SYNC_DIRECTORY_MODIFIED_AT, directoryModifiedAt)
+                    .detail(Details.SYNC_DETECTED_AT, Long.toString(now))
+                    .success();
+        }
+
+        logger.warnf("Resolved %s conflict for user '%s' using policy %s. Winner: %s",
+                attribute, user.getUsername(), policy, winner);
+    }
+
+    private static String join(List<String> values) {
+        return values == null ? "" : String.join(" | ", values.stream().map(value -> value == null ? "" : value).toList());
+    }
+
+    private static boolean valuesEqual(List<String> left, List<String> right) {
+        return UserSyncMetadata.normalize(left).equals(UserSyncMetadata.normalize(right));
     }
 
     @Override

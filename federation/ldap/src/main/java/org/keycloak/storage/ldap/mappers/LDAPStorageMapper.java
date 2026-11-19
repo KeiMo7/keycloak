@@ -29,6 +29,7 @@ import org.keycloak.provider.Provider;
 import org.keycloak.storage.ldap.LDAPStorageProvider;
 import org.keycloak.storage.ldap.idm.model.LDAPObject;
 import org.keycloak.storage.ldap.idm.query.internal.LDAPQuery;
+import org.keycloak.storage.user.SyncConflict;
 import org.keycloak.storage.user.SynchronizationResult;
 
 /**
@@ -75,6 +76,17 @@ public interface LDAPStorageMapper extends Provider {
      * @param isCreate true if we importing new user from LDAP. False if user already exists in Keycloak, but we are upgrading (syncing) it from LDAP
      */
     void onImportUserFromLDAP(LDAPObject ldapUser, UserModel user, RealmModel realm, boolean isCreate);
+
+    /**
+     * Conflicts detected by the most recent call to {@link #onImportUserFromLDAP}.
+     * The synchronization engine consumes and resets these after each user.
+     */
+    default List<SyncConflict> getImportConflicts() {
+        return List.of();
+    }
+
+    default void resetImportConflicts() {
+    }
 
 
     /**

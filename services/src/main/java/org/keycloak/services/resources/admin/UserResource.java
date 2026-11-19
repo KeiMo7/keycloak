@@ -116,6 +116,7 @@ import org.keycloak.services.resources.LoginActionsService;
 import org.keycloak.services.resources.admin.fgap.AdminPermissionEvaluator;
 import org.keycloak.services.validation.Validation;
 import org.keycloak.storage.ReadOnlyException;
+import org.keycloak.storage.user.UserSyncMetadata;
 import org.keycloak.userprofile.UserProfile;
 import org.keycloak.userprofile.UserProfileProvider;
 import org.keycloak.userprofile.ValidationException;
@@ -202,6 +203,8 @@ public class UserResource {
 
             boolean wasEnabled = user.isEnabled();
             boolean wasPermanentlyLockedOut = false;
+            Map<String, List<String>> localSnapshot = user.isFederated() ? UserSyncMetadata.snapshot(user) : null;
+            String localActor = auth.adminAuth().getUser() == null ? "admin" : auth.adminAuth().getUser().getUsername();
             if (rep.isEnabled() != null && rep.isEnabled()) {
                 if (!user.isEnabled() || session.getProvider(BruteForceProtector.class).isTemporarilyDisabled(session, realm, user)) {
                     UserLoginFailureModel failureModel = session.loginFailures().getUserLoginFailure(realm, user.getId());
@@ -239,6 +242,9 @@ public class UserResource {
                 auth.users().requireResetPassword(user);
             }
             RepresentationToModel.createCredentials(rep, session, realm, user, true);
+            if (localSnapshot != null) {
+                UserSyncMetadata.recordLocalChanges(user, localSnapshot, localActor, Time.currentTimeMillis());
+            }
 
             // we need to do it here as the attributes would be overwritten by what is in the rep
             if (wasPermanentlyLockedOut) {

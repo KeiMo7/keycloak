@@ -202,16 +202,20 @@ public class LDAPGroupMapperSyncWithGroupsPathTest extends AbstractLDAPTest {
             LDAPTestUtils.updateConfigOptions(mapperModel, GroupMapperConfig.DROP_NON_EXISTING_GROUPS_DURING_SYNC, "true");
             realm.updateComponent(mapperModel);
 
-            // Sync groups again from LDAP. Assert LDAP non-existing groups deleted
+            // Delete a directory-managed group from LDAP
+            GroupLDAPStorageMapper groupMapper = LDAPTestUtils.getGroupMapper(mapperModel, LDAPTestUtils.getLdapProvider(session, ctx.getLdapModel()), realm);
+            LDAPTestUtils.getLdapProvider(session, ctx.getLdapModel()).getLdapIdentityStore().remove(groupMapper.loadLDAPGroupByName("group12"));
+
+            // Sync groups again from LDAP. Assert only the directory-managed group is deleted
             syncResult = new GroupLDAPStorageMapperFactory().create(session, mapperModel).syncDataFromFederationProviderToKeycloak(realm);
-            Assertions.assertEquals(3, syncResult.getUpdated());
-            Assertions.assertTrue(syncResult.getRemoved() == 2);
+            Assertions.assertEquals(2, syncResult.getUpdated());
+            Assertions.assertEquals(1, syncResult.getRemoved());
 
             // Sync and assert groups updated
             Assertions.assertNotNull(KeycloakModelUtils.findGroupByPath(session, realm, LDAP_GROUPS_PATH + "/group1/group11"));
-            Assertions.assertNotNull(KeycloakModelUtils.findGroupByPath(session, realm, LDAP_GROUPS_PATH + "/group1/group12"));
-            Assertions.assertNull(KeycloakModelUtils.findGroupByPath(session, realm, LDAP_GROUPS_PATH + "/model1"));
-            Assertions.assertNull(KeycloakModelUtils.findGroupByPath(session, realm, LDAP_GROUPS_PATH + "/group1/model2"));
+            Assertions.assertNull(KeycloakModelUtils.findGroupByPath(session, realm, LDAP_GROUPS_PATH + "/group1/group12"));
+            Assertions.assertNotNull(KeycloakModelUtils.findGroupByPath(session, realm, LDAP_GROUPS_PATH + "/model1"));
+            Assertions.assertNotNull(KeycloakModelUtils.findGroupByPath(session, realm, LDAP_GROUPS_PATH + "/group1/model2"));
             Assertions.assertNotNull(KeycloakModelUtils.findGroupByPath(session, realm, "/outside"));
         });
     }

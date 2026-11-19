@@ -73,6 +73,7 @@ public class LDAPQuery implements AutoCloseable {
     private final Set<Sort> ordering = new LinkedHashSet<>();
 
     private final Set<String> returningLdapAttributes = new LinkedHashSet<>();
+    private byte[] initialPaginationCookie;
 
     // Contains just those returningLdapAttributes, which are read-only. They will be marked as read-only in returned LDAPObject instances as well
     // NOTE: names of attributes are lower-cased to avoid case sensitivity issues (LDAP searching is usually case-insensitive, so we want to be as well)
@@ -230,11 +231,19 @@ public class LDAPQuery implements AutoCloseable {
         return this;
     }
 
+    public LDAPQuery setInitialPaginationCookie(byte[] initialPaginationCookie) {
+        this.initialPaginationCookie = initialPaginationCookie;
+        return this;
+    }
+
     public LDAPQuery initPagination() throws NamingException {
         this.ldapContextManager = LDAPContextManager.create(ldapFedProvider.getSession(),
                 ldapFedProvider.getLdapIdentityStore().getConfig(),
                 ldapFedProvider.getLdapIdentityStore().getRequestTimer());
         this.paginationContext = new PaginationContext(ldapContextManager.getLdapContext());
+        if (initialPaginationCookie != null) {
+            this.paginationContext.setCookie(initialPaginationCookie);
+        }
         return this;
     }
 

@@ -137,6 +137,8 @@ public class LDAPUtils {
         ldapQuery.setSearchDn(config.getUsersDn());
         ldapQuery.addObjectClasses(config.getUserObjectClasses());
         ldapQuery.setUserQuery(true);
+        ldapQuery.addReturningLdapAttribute(LDAPConstants.CREATE_TIMESTAMP);
+        ldapQuery.addReturningLdapAttribute(LDAPConstants.MODIFY_TIMESTAMP);
 
         String customFilter = config.getCustomUserSearchFilter();
         if (customFilter != null) {
